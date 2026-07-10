@@ -9,7 +9,7 @@ package main
 
 import (
 	"archive/tar"
-	"bytes"
+	"bufio"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
@@ -54,7 +54,18 @@ func run(getenv func(string) string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "params: name, version and checksum are required")
 		return exitHard
 	}
-	data, retryable, err := download(p.Name, p.Version)
+	// Stream the download to a temp file (hashing inline) instead of buffering
+	// it in memory — the import may run under a cgroup memory cap. outDir is
+	// the one dir the fetcher contract guarantees writable; the temp file is
+	// removed before exit.
+	tmp, err := os.CreateTemp(outDir, ".fetch-*.tmp")
+	if err != nil {
+		fmt.Fprintf(stderr, "temp file: %v\n", err)
+		return exitHard
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	got, retryable, err := download(p.Name, p.Version, tmp)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		if retryable {
@@ -62,48 +73,57 @@ func run(getenv func(string) string, stderr io.Writer) int {
 		}
 		return exitHard
 	}
-	if err := verifyAndExtract(data, p, outDir); err != nil {
+	if got != p.Checksum {
+		fmt.Fprintf(stderr, "sha256 mismatch for %s-%s: got %s want %s\n", p.Name, p.Version, got, p.Checksum)
+		return exitHard
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		fmt.Fprintf(stderr, "seek: %v\n", err)
+		return exitHard
+	}
+	if err := extractCrate(bufio.NewReader(tmp), p, outDir); err != nil {
 		fmt.Fprintln(stderr, err)
 		return exitHard // bad pinned content / unsafe archive — not transient
 	}
 	return exitOK
 }
 
-// download fetches the .crate archive. The bool reports whether a failure is
-// retryable (network error, 5xx, or 429).
-func download(name, version string) ([]byte, bool, error) {
-	url := fmt.Sprintf("https://static.crates.io/crates/%s/%s-%s.crate", name, name, version)
+// cratesBase is the static.crates.io download URL base; a var so tests can
+// point it at a local server.
+var cratesBase = "https://static.crates.io/crates"
+
+// download streams the .crate archive into w, returning the hex sha256 of the
+// bytes. The bool reports whether a failure is retryable (network error, 5xx,
+// or 429).
+func download(name, version string, w io.Writer) (string, bool, error) {
+	url := fmt.Sprintf("%s/%s/%s-%s.crate", cratesBase, name, name, version)
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, true, fmt.Errorf("GET %s: %w", url, err)
+		return "", true, fmt.Errorf("GET %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
-		return nil, retryable, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+		return "", retryable, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, fmt.Errorf("read body: %w", err)
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(w, h), resp.Body); err != nil {
+		return "", true, fmt.Errorf("read body: %w", err)
 	}
-	return data, false, nil
+	return hex.EncodeToString(h.Sum(nil)), false, nil
 }
 
-// verifyAndExtract checks sha256(data) == p.Checksum, unpacks the gzip-tar into
-// outDir (entries are rooted at <name>-<version>/), and writes
+// extractCrate unpacks the checksum-verified gzip-tar read from r into outDir
+// (entries are rooted at <name>-<version>/), and writes
 // <name>-<version>/.cargo-checksum.json with the full per-file sha256 map +
 // the package checksum (what cargo's directory source requires).
-func verifyAndExtract(data []byte, p params, outDir string) error {
-	sum := sha256.Sum256(data)
-	if got := hex.EncodeToString(sum[:]); got != p.Checksum {
-		return fmt.Errorf("sha256 mismatch for %s-%s: got %s want %s", p.Name, p.Version, got, p.Checksum)
-	}
+func extractCrate(r io.Reader, p params, outDir string) error {
 	root := fmt.Sprintf("%s-%s", p.Name, p.Version)
 	rootDir := filepath.Join(outDir, root)
 	files := map[string]string{}
 
-	gz, err := gzip.NewReader(bytes.NewReader(data))
+	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return fmt.Errorf("gunzip: %w", err)
 	}
